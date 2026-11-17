@@ -1,0 +1,105 @@
+name: Self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  valid-passes:
+    name: valid file passes (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        uses: ./
+        with:
+          files: fixtures/valid-pdfa-2b.pdf
+      - name: One file checked, none failed
+        run: |
+          test "${{ steps.check.outputs.checked }}" = "1"
+          test "${{ steps.check.outputs.failed }}" = "0"
+
+  invalid-fails:
+    name: invalid file fails the job (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        continue-on-error: true
+        uses: ./
+        with:
+          files: fixtures/invalid-not-pdfa.pdf
+      - name: The step must have failed
+        run: |
+          test "${{ steps.check.outcome }}" = "failure"
+          test "${{ steps.check.outputs.failed }}" = "1"
+
+  mixed-folder:
+    name: folder with one bad file (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        continue-on-error: true
+        uses: ./
+        with:
+          files: "fixtures/*.pdf"
+      - name: Two checked, one failed, step failed
+        run: |
+          test "${{ steps.check.outcome }}" = "failure"
+          test "${{ steps.check.outputs.checked }}" = "2"
+          test "${{ steps.check.outputs.failed }}" = "1"
+
+  report-only:
+    name: fail-on-invalid false only reports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        uses: ./
+        with:
+          files: fixtures/invalid-not-pdfa.pdf
+          fail-on-invalid: "false"
+      - run: test "${{ steps.check.outputs.failed }}" = "1"
+
+  profile-is-honoured:
+    name: PDF/A-2b file fails the a1b profile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        continue-on-error: true
+        uses: ./
+        with:
+          files: fixtures/valid-pdfa-2b.pdf
+          profile: a1b
+      - run: test "${{ steps.check.outcome }}" = "failure"
+
+  empty-match-fails:
+    name: a pattern that matches nothing fails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        continue-on-error: true
+        uses: ./
+        with:
+          files: "does-not-exist/*.pdf"
+      - run: test "${{ steps.check.outcome }}" = "failure"

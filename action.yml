@@ -1,0 +1,136 @@
+name: Validate PDF/A with PDFluent
+description: Fail a workflow when a PDF is not PDF/A conformant. Runs the PDFluent command-line tool, no upload, no account.
+author: PDFluent
+branding:
+  icon: check-circle
+  color: gray-dark
+
+inputs:
+  files:
+    description: >-
+      PDF files to check, one glob pattern per line, relative to working-directory.
+      "**" matches across directories.
+    required: false
+    default: "**/*.pdf"
+  profile:
+    description: PDF/A profile to check against. One of a1b, a2b, a3b.
+    required: false
+    default: a2b
+  version:
+    description: PDFluent CLI release to install, for example 1.4.0.
+    required: false
+    default: "1.4.0"
+  working-directory:
+    description: Directory the patterns are resolved in.
+    required: false
+    default: "."
+  fail-on-invalid:
+    description: Fail the step when a file is not conformant. Set to "false" to only report.
+    required: false
+    default: "true"
+  allow-empty:
+    description: Pass when no file matches. By default a pattern list that matches nothing fails, so a typo cannot turn the check green.
+    required: false
+    default: "false"
+
+outputs:
+  checked:
+    description: Number of PDFs checked.
+    value: ${{ steps.validate.outputs.checked }}
+  failed:
+    description: Number of PDFs that are not conformant or could not be read.
+    value: ${{ steps.validate.outputs.failed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install the PDFluent CLI
+      shell: bash
+      env:
+        PDFLUENT_VERSION: ${{ inputs.version }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+        RUNNER_ARCH_NAME: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        if ! [[ "$PDFLUENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::version must look like 1.4.0, got '$PDFLUENT_VERSION'"; exit 1
+        fi
+        case "$RUNNER_OS_NAME/$RUNNER_ARCH_NAME" in
+          Linux/X64)   target=x86_64-unknown-linux-musl ;;
+          Linux/ARM64) target=aarch64-unknown-linux-musl ;;
+          macOS/ARM64) target=aarch64-apple-darwin ;;
+          macOS/X64)   target=x86_64-apple-darwin ;;
+          *) echo "::error::unsupported runner $RUNNER_OS_NAME/$RUNNER_ARCH_NAME (Linux and macOS are supported)"; exit 1 ;;
+        esac
+        base="https://github.com/pdfluent/pdfluent-sdk/releases/download/v${PDFLUENT_VERSION}"
+        archive="pdfluent-${PDFLUENT_VERSION}-${target}.tar.gz"
+        dir="${RUNNER_TEMP}/pdfluent-cli"
+        rm -rf "$dir"; mkdir -p "$dir"
+        curl --fail --silent --show-error --location --retry 3 --max-time 120 -o "$dir/$archive" "$base/$archive"
+        curl --fail --silent --show-error --location --retry 3 --max-time 120 -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
+        expected="$(awk -v f="$archive" '$2==f {print $1}' "$dir/SHA256SUMS")"
+        if [ -z "$expected" ]; then echo "::error::$archive is not listed in SHA256SUMS"; exit 1; fi
+        if command -v sha256sum >/dev/null; then actual="$(sha256sum "$dir/$archive" | awk '{print $1}')"; else actual="$(shasum -a 256 "$dir/$archive" | awk '{print $1}')"; fi
+        if [ "$expected" != "$actual" ]; then echo "::error::checksum mismatch for $archive"; exit 1; fi
+        tar -xzf "$dir/$archive" -C "$dir"
+        echo "$dir" >> "$GITHUB_PATH"
+        "$dir/pdfluent" --version
+
+    - name: Validate
+      id: validate
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PATTERNS: ${{ inputs.files }}
+        PROFILE: ${{ inputs.profile }}
+        FAIL_ON_INVALID: ${{ inputs.fail-on-invalid }}
+        ALLOW_EMPTY: ${{ inputs.allow-empty }}
+      run: |
+        set -uo pipefail
+        case "$PROFILE" in a1b|a2b|a3b) ;; *) echo "::error::profile must be a1b, a2b or a3b, got '$PROFILE'"; exit 1 ;; esac
+        # Python does the globbing: macOS runners ship bash 3.2, which has no globstar.
+        files=()
+        while IFS= read -r -d '' f; do files+=("$f"); done < <(python3 - <<'PY'
+        import glob, os, sys
+        seen = []
+        for pattern in os.environ["PATTERNS"].splitlines():
+            pattern = pattern.strip()
+            if not pattern:
+                continue
+            for f in sorted(glob.glob(pattern, recursive=True)):
+                if os.path.isfile(f) and f not in seen:
+                    seen.append(f)
+        sys.stdout.write("".join(f + "\0" for f in seen))
+        PY
+        )
+        checked=${#files[@]}; failed=0
+        summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+        {
+          echo "### PDF/A validation (profile ${PROFILE})"
+          echo
+          echo "| File | Result |"
+          echo "|---|---|"
+        } >> "$summary"
+        if [ "$checked" -eq 0 ]; then
+          echo "checked=0" >> "$GITHUB_OUTPUT"; echo "failed=0" >> "$GITHUB_OUTPUT"
+          if [ "$ALLOW_EMPTY" = "true" ]; then echo "No PDF matched; allow-empty is set."; exit 0; fi
+          echo "::error::No PDF matched the patterns. Check 'files' and 'working-directory', or set allow-empty."
+          exit 1
+        fi
+        for f in "${files[@]}"; do
+          if out="$(pdfluent validate --pdfa --profile "$PROFILE" "$f" 2>&1)"; then
+            echo "ok   $f"
+            echo "| \`$f\` | conformant |" >> "$summary"
+          else
+            failed=$((failed + 1))
+            echo "FAIL $f"; echo "$out" | sed 's/^/     /'
+            first="$(echo "$out" | head -n 1)"
+            echo "::error file=$f::$first"
+            echo "| \`$f\` | $first |" >> "$summary"
+          fi
+        done
+        echo "checked=$checked" >> "$GITHUB_OUTPUT"
+        echo "failed=$failed" >> "$GITHUB_OUTPUT"
+        echo "$checked checked, $failed failed"
+        if [ "$failed" -gt 0 ] && [ "$FAIL_ON_INVALID" != "false" ]; then exit 1; fi
+        exit 0
